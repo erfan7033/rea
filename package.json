@@ -77,6 +77,7 @@
     "scripts/rea-gui.mjs",
     "scripts/rea-dotnet-decompile.mjs",
     "scripts/lib/dotnet-extraction.mjs",
+    "scripts/lib/dotnet-deconstruction.mjs",
     "scripts/lib/cli-process-environment.mjs",
     "scripts/rea-android-workspace-guardian.mjs",
     "scripts/electron-active-hook.cjs",

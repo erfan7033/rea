@@ -35,6 +35,7 @@ import { homedir } from "node:os";
 import { basename, dirname, extname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { createHash } from "node:crypto";
 import {
   countSourceFiles,
   exists,
@@ -47,6 +48,13 @@ import {
   scanDecompiledDirectory,
   sha256File,
 } from "./lib/dotnet-extraction.mjs";
+import {
+  collectAdjacentFiles,
+  collectDeployment,
+  deploymentSummary,
+  recoverSymbols,
+  sourceOutputName,
+} from "./lib/dotnet-deconstruction.mjs";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const reaEntry = join(repoRoot, "scripts", "rea.mjs");
@@ -67,6 +75,9 @@ const parseArgs = (argv) => {
     rewriteReferences: true,
     hashScan: true,
     licenseScan: true,
+    symbols: true,
+    resources: true,
+    deployment: true,
     detect: false,
     repo: false,
     gitInit: false,
@@ -89,6 +100,9 @@ const parseArgs = (argv) => {
       options.rewriteReferences = false;
     else if (value === "--no-hash-scan") options.hashScan = false;
     else if (value === "--no-license-scan") options.licenseScan = false;
+    else if (value === "--no-symbols") options.symbols = false;
+    else if (value === "--no-resources") options.resources = false;
+    else if (value === "--no-deployment") options.deployment = false;
     else if (value === "--detect") options.detect = true;
     else if (value === "--repo") options.repo = true;
     else if (value === "--git-init") options.gitInit = true;
@@ -125,6 +139,9 @@ Options:
   --no-reference-rewrite  Keep ILSpy's original reference paths
   --no-hash-scan          Skip hash and obfuscated-name scanning
   --no-license-scan       Skip license-dongle check detection
+  --no-symbols            Skip PDB symbol recovery and embedded-source extraction
+  --no-resources          Skip managed-resource enumeration and recovery
+  --no-deployment         Skip deployment-manifest and adjacent-file collection
   --detect                Report the detected layout as JSON without writing anything
   --repo                  Add README, build scripts, solution, and agent handoff
   --git-init              Initialize a git repository in the output directory
@@ -425,6 +442,246 @@ const ilspyProjectArgs = ({ output, referencePath, usePdb, bundleEntry }) => {
   if (referencePath !== undefined) args.push("-r", referencePath);
   if (usePdb) args.push("-usepdb");
   return args;
+};
+
+const MAX_RESOURCE_ENTRIES = 200;
+const MAX_RESOURCE_BYTES = 8 * 1024 * 1024;
+const MAX_ADJACENT_BYTES = 4 * 1024 * 1024;
+const MAX_FIND_FILES = 5000;
+
+const sha256Bytes = (bytes) => createHash("sha256").update(bytes).digest("hex");
+
+/** Depth-bounded search for a file by exact base name under a directory. */
+const findFileByName = async (root, leaf) => {
+  const wanted = leaf.toLowerCase();
+  const stack = [root];
+  let visited = 0;
+  while (stack.length > 0 && visited < MAX_FIND_FILES) {
+    const current = stack.pop();
+    let entries;
+    try {
+      entries = await readdir(current, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      visited += 1;
+      if (visited > MAX_FIND_FILES) break;
+      const entryPath = join(current, entry.name);
+      if (entry.isDirectory()) {
+        if (entry.name !== "bin" && entry.name !== "obj") stack.push(entryPath);
+      } else if (
+        entry.isFile() &&
+        entry.name.toLowerCase() === wanted
+      ) {
+        return entryPath;
+      }
+    }
+  }
+  return undefined;
+};
+
+const resourceOutputName = (name, index) => {
+  const leaf = String(name).split("/").pop() || "resource";
+  return `${String(index).padStart(3, "0")}-${safeName(leaf)}`;
+};
+
+const listManagedResources = async (ilspyPath, path, env) => {
+  const result = await run(
+    ilspyPath,
+    ["--disable-updatecheck", "--list-resources", path],
+    { env, timeout: 120_000 },
+  );
+  if (result.code !== 0) {
+    return {
+      ok: false,
+      error:
+        result.stderr.trim().split("\n")[0] ??
+        `ilspycmd --list-resources exited ${String(result.code)}`,
+    };
+  }
+  const entries = result.stdout
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+    .slice(0, MAX_RESOURCE_ENTRIES);
+  return { ok: true, entries };
+};
+
+/**
+ * Recover managed resources. ILSpy project output already materializes most
+ * resources (config JSON, .resx from .resources, XAML from BAML); entries
+ * already present are recorded, not duplicated. Missing entries are extracted
+ * with `ilspycmd --resource` into resources/<stem>/.
+ */
+const recoverAssemblyResources = async ({
+  ilspyPath,
+  assemblyPath,
+  assemblyOutput,
+  outputPath,
+  resourcesDirectory,
+  stem,
+  env,
+}) => {
+  const listed = await listManagedResources(ilspyPath, assemblyPath, env);
+  if (!listed.ok) return { status: "unknown", entries: [], error: listed.error };
+  if (listed.entries.length === 0)
+    return { status: "none", entries: [], error: null };
+  await mkdir(resourcesDirectory, { recursive: true });
+  const entries = [];
+  for (const [index, name] of listed.entries.entries()) {
+    const leaf = String(name).split("/").pop();
+    const container = String(name).split("/")[0];
+    const materialized =
+      leaf.length > 0
+        ? await findFileByName(assemblyOutput, leaf)
+        : undefined;
+    // A .resources container usually materializes as a sibling .resx, and a
+    // nested entry's value lives inside that same .resx.
+    const containerResx =
+      materialized === undefined &&
+      container.endsWith(".resources")
+        ? await findFileByName(
+            assemblyOutput,
+            `${container.slice(0, -".resources".length)}.resx`,
+          )
+        : undefined;
+    const found = materialized ?? containerResx;
+    if (found !== undefined) {
+      entries.push({
+        name,
+        status: "recovered-via-project",
+        output: relative(outputPath, found),
+      });
+      continue;
+    }
+    const outputName = resourceOutputName(name, index);
+    const targetPath = join(resourcesDirectory, outputName);
+    const extracted = await run(
+      ilspyPath,
+      [
+        "--disable-updatecheck",
+        "-o",
+        resourcesDirectory,
+        "--resource",
+        name,
+        assemblyPath,
+      ],
+      { env, timeout: 120_000 },
+    );
+    // ilspycmd writes the resource leaf into the output directory; move it to
+    // the indexed name so nested entries cannot collide or escape.
+    const written = join(resourcesDirectory, leaf);
+    if (extracted.code === 0 && (await exists(written))) {
+      let info;
+      try {
+        info = await stat(written);
+      } catch {
+        info = null;
+      }
+      if (info !== null && info.isFile() && info.size <= MAX_RESOURCE_BYTES) {
+        const bytes = await readFile(written);
+        await writeFile(targetPath, bytes);
+        if (written !== targetPath) await rm(written, { force: true });
+        entries.push({
+          name,
+          status: "extracted",
+          output: relative(outputPath, targetPath),
+          bytes: bytes.length,
+          sha256: sha256Bytes(bytes),
+        });
+        continue;
+      }
+      await rm(written, { force: true }).catch(() => {});
+      entries.push({
+        name,
+        status: "skipped",
+        output: null,
+        error: `resource exceeds ${String(MAX_RESOURCE_BYTES)} byte extraction bound`,
+      });
+      continue;
+    }
+    entries.push({
+      name,
+      status: "failed",
+      output: null,
+      error:
+        extracted.stderr.trim().split("\n")[0] ??
+        `ilspycmd --resource exited ${String(extracted.code)}`,
+    });
+  }
+  const recovered = entries.filter(
+    (entry) =>
+      entry.status === "recovered-via-project" || entry.status === "extracted",
+  ).length;
+  return {
+    status: recovered === entries.length ? "ok" : recovered > 0 ? "partial" : "failed",
+    entries,
+    error: null,
+  };
+};
+
+/**
+ * Recover PDB symbol evidence and embedded sources for one assembly. The
+ * evidence record stays small (documents, hashes, SourceLink); raw source
+ * bytes live under sources/<stem>/ with one file per PDB document row.
+ */
+const recoverAssemblySymbols = async ({
+  assemblyPath,
+  evidenceDirectory,
+  sourcesDirectory,
+  stem,
+  outputPath,
+}) => {
+  const symbols = await recoverSymbols(assemblyPath);
+  const record = {
+    kind: symbols.kind,
+    documents: (symbols.documents ?? []).map((document) => ({
+      path: document.path,
+      language: document.language,
+      hash_algorithm: document.hash_algorithm,
+      hash: document.hash,
+    })),
+    source_link: symbols.source_link,
+    embedded_sources: [],
+    error: symbols.error ?? null,
+  };
+  if (
+    symbols.kind !== null &&
+    symbols.embedded_sources !== undefined &&
+    symbols.embedded_sources.length > 0
+  ) {
+    const assemblySources = join(sourcesDirectory, stem);
+    await mkdir(assemblySources, { recursive: true });
+    const used = new Set();
+    for (const source of symbols.embedded_sources) {
+      const document = symbols.documents.find(
+        (entry) => entry.path === source.path,
+      );
+      const row = document?.row ?? 0;
+      let fileName = sourceOutputName(source.path, row);
+      let candidate = fileName;
+      let counter = 1;
+      while (used.has(candidate)) {
+        counter += 1;
+        candidate = `${fileName}-${String(counter)}`;
+      }
+      used.add(candidate);
+      const output = join(assemblySources, candidate);
+      await writeFile(output, source.bytes);
+      record.embedded_sources.push({
+        path: source.path,
+        output: relative(outputPath, output),
+        bytes: source.bytes.length,
+        sha256: sha256Bytes(source.bytes),
+      });
+    }
+  }
+  await writeFile(
+    join(evidenceDirectory, `${stem}.symbols.json`),
+    `${JSON.stringify(record, null, 2)}\n`,
+  );
+  return record;
 };
 
 const listBundleEntries = async (ilspyPath, path, env) => {
@@ -775,6 +1032,10 @@ Generated by REA from:
 
 - \`decompiled/\` — reconstructed C# and project files
 - \`evidence/\` — REA evidence bundles (metadata, hashes, coverage)
+- \`sources/\` — byte-identical embedded sources recovered from PDBs
+- \`resources/\` — managed resources missing from project output
+- \`config/\` — small adjacent files (configs, sidecar PDBs when small)
+- \`deployment.json\` — deployment manifests and NuGet/framework summary
 - \`il2cpp/\` — IL2CPP dummy assemblies and \`dump.cs\` when present
 - \`manifest.json\` — machine-readable extraction record
 - \`REPORT.md\` — extraction report and limitations
@@ -825,6 +1086,9 @@ You are working on a decompiled .NET product. The extraction is already complete
 - \`REPORT.md\`
 - \`decompiled/\`
 - \`evidence/\`
+- \`sources/\` (embedded sources recovered from PDBs)
+- \`deployment.json\` (frameworks, packages, assets)
+- \`resources/\` (recovered managed resources)
 ${manifest.il2cpp === null ? "" : "- \`il2cpp/\` (dummy assemblies and native RVA map)\n"}
 ## Goal
 
@@ -904,8 +1168,14 @@ This repository is decompiled output, not the original source. Treat it as evide
 
 - IL2CPP method bodies. IL2CPP compiles IL to native code; dummy assemblies carry names, fields, and RVA addresses, not C# bodies.
 - Native or mixed-mode implementation code.
-- Original comments, local variable names, and source layout.
+- Original comments and source layout. Local variable names come from PDBs only when the producer shipped them; decompiled names are otherwise ILSpy inference.
 - Obfuscated or protected logic in its original form.
+
+## Recovered byte-identical artifacts
+
+- \`sources/\` files are producer-embedded PDB copies, not decompiled output. They are the closest thing to original source in this repository.
+- \`resources/\` and \`config/\` files are extracted or copied bytes, recorded with sha256 in \`manifest.json\`.
+- \`deployment.json\` records the shipped target frameworks, NuGet packages, and runtime/native assets from \`.deps.json\` and \`.runtimeconfig.json\`.
 
 ## Not guaranteed
 
@@ -930,12 +1200,15 @@ Decompilation is not proof of behavior equivalence.
 1. Build each project.
 2. Run static checks and unit tests that you write from observed behavior.
 3. Compare public API signatures against \`manifest.json\` and the original assemblies.
-4. Exercise entry points in an isolated environment only after explicit approval.
+4. Diff \`sources/\` against \`decompiled/\` where both cover a file; embedded sources win on conflicts.
+5. Confirm \`deployment.json\` frameworks and packages match the projects you build against.
+6. Exercise entry points in an isolated environment only after explicit approval.
 
 ## Evidence boundaries
 
 - \`manifest.json\` and \`evidence/\` describe what REA observed.
-- Decompiled C# is inference, not original source.
+- Decompiled C# is inference, not original source. \`sources/\` files are byte-identical PDB copies and outrank decompiled text.
+- SourceLink mappings are recorded evidence only; never fetch them without explicit approval.
 - IL2CPP dummy assemblies contain empty method bodies; do not treat them as implemented logic.
 - Unresolved calls, reflection, dependency injection, and dynamic loading remain unknown unless separately verified.
 `;
@@ -1159,6 +1432,9 @@ const main = async () => {
 
   const evidenceDirectory = join(outputPath, "evidence");
   const decompiledDirectory = join(outputPath, "decompiled");
+  const sourcesDirectory = join(outputPath, "sources");
+  const resourcesDirectory = join(outputPath, "resources");
+  const configDirectory = join(outputPath, "config");
   await mkdir(evidenceDirectory, { recursive: true });
   await mkdir(decompiledDirectory, { recursive: true });
 
@@ -1416,6 +1692,8 @@ const main = async () => {
       member_summary: null,
       ilspy_exit: null,
       decompiled_files: 0,
+      symbols: null,
+      resources: null,
       status: "pending",
       errors: [],
     };
@@ -1505,6 +1783,46 @@ const main = async () => {
     } else {
       entry.license_scan = null;
     }
+
+    if (options.symbols) {
+      try {
+        entry.symbols = await recoverAssemblySymbols({
+          assemblyPath: candidate,
+          evidenceDirectory,
+          sourcesDirectory,
+          stem,
+          outputPath,
+        });
+      } catch (cause) {
+        entry.symbols = null;
+        entry.errors.push(
+          `symbols: ${cause instanceof Error ? cause.message : String(cause)}`,
+        );
+      }
+    } else {
+      entry.symbols = null;
+    }
+
+    if (options.resources && entry.decompiled_files > 0) {
+      try {
+        entry.resources = await recoverAssemblyResources({
+          ilspyPath,
+          assemblyPath: candidate,
+          assemblyOutput,
+          outputPath,
+          resourcesDirectory: join(resourcesDirectory, stem),
+          stem,
+          env,
+        });
+      } catch (cause) {
+        entry.resources = { status: "unknown", entries: [], error: String(cause?.message ?? cause) };
+        entry.errors.push(
+          `resources: ${cause instanceof Error ? cause.message : String(cause)}`,
+        );
+      }
+    } else {
+      entry.resources = null;
+    }
     assemblies.push(entry);
 
     progress(
@@ -1532,8 +1850,66 @@ const main = async () => {
     else if (assembly.license_scan?.status === "suspicious")
       licenseSuspicious += 1;
   }
+  // Deployment manifests and adjacent files describe the product as shipped:
+  // target frameworks, NuGet/native assets, configs, and sidecar PDBs.
+  // Collected once per run, never executed, never fetched from the network.
+  let deployment = null;
+  let adjacent = [];
+  if (options.deployment) {
+    const deploymentRoot = inputIsDirectory ? inputPath : dirname(inputPath);
+    try {
+      const manifests = await collectDeployment(deploymentRoot);
+      const summary = deploymentSummary(manifests);
+      deployment = {
+        manifests: manifests.map((manifest) => ({
+          path: manifest.path,
+          kind: manifest.kind,
+          parsed: manifest.parsed,
+        })),
+        summary,
+      };
+      await writeFile(
+        join(outputPath, "deployment.json"),
+        `${JSON.stringify(deployment, null, 2)}\n`,
+      );
+    } catch (cause) {
+      deployment = {
+        manifests: [],
+        summary: null,
+        error: cause instanceof Error ? cause.message : String(cause),
+      };
+    }
+    try {
+      const listed = await collectAdjacentFiles(deploymentRoot);
+      for (const file of listed) {
+        const record = {
+          path: file.path,
+          kind: file.kind,
+          bytes: file.bytes,
+          output: null,
+          sha256: null,
+        };
+        if (file.bytes !== null && file.bytes <= MAX_ADJACENT_BYTES) {
+          try {
+            const bytes = await readFile(file.path);
+            const outputName = `${safeName(basename(file.path))}`;
+            await mkdir(configDirectory, { recursive: true });
+            const output = join(configDirectory, outputName);
+            if (!(await exists(output))) await writeFile(output, bytes);
+            record.output = relative(outputPath, output);
+            record.sha256 = sha256Bytes(bytes);
+          } catch {
+            // Record presence without content; the error stays on the file.
+          }
+        }
+        adjacent.push(record);
+      }
+    } catch {
+      adjacent = [];
+    }
+  }
   const manifest = {
-    schema: "rea.dotnet-decompile/4",
+    schema: "rea.dotnet-decompile/5",
     generated_at: new Date().toISOString(),
     input: inputPath,
     output: outputPath,
@@ -1587,6 +1963,26 @@ const main = async () => {
     license_scan: options.licenseScan
       ? { present: licensePresent, suspicious: licenseSuspicious }
       : null,
+    symbols: options.symbols
+      ? {
+          assemblies_with_pdb:
+            assemblies.filter((entry) => entry.symbols?.kind !== null && entry.symbols?.kind !== undefined).length,
+          embedded_sources: assemblies.reduce(
+            (total, entry) => total + (entry.symbols?.embedded_sources?.length ?? 0),
+            0,
+          ),
+        }
+      : null,
+    resources: options.resources
+      ? {
+          entries: assemblies.reduce(
+            (total, entry) => total + (entry.resources?.entries?.length ?? 0),
+            0,
+          ),
+        }
+      : null,
+    deployment,
+    adjacent,
     repo: null,
     build: null,
   };
@@ -1676,6 +2072,50 @@ ${manifest.build === null ? "" : `- Build attempt: ${manifest.build.ok ? "all pr
     manifest.license_scan === null
       ? "- License-dongle scanning was disabled with --no-license-scan."
       : `- Assemblies with dongle evidence: ${manifest.license_scan.present}; keyword-only: ${manifest.license_scan.suspicious}\n\n${licenseRows || "- No assemblies scanned."}\n\nFindings describe license checks observed in static evidence (assembly references, P/Invoke imports, string keywords). This workflow does not provide bypass, defeat, or circumvention guidance.`;
+  const symbolRows = assemblies
+    .filter((entry) => entry.symbols !== null && entry.symbols !== undefined)
+    .map((entry) => {
+      const symbols = entry.symbols;
+      if (symbols.kind === null || symbols.kind === undefined)
+        return `- \`${entry.name}\`: no PDB (embedded or sidecar)${symbols.error === null || symbols.error === undefined ? "" : ` (${symbols.error})`}`;
+      const sources = symbols.embedded_sources.length;
+      return `- \`${entry.name}\` (${symbols.kind} PDB): ${String(symbols.documents.length)} documents, ${String(sources)} embedded sources${symbols.source_link === null ? "" : ", SourceLink present"}`;
+    })
+    .join("\n");
+  const symbolSection =
+    manifest.symbols === null
+      ? "- Symbol recovery was disabled with --no-symbols."
+      : `- Assemblies with a PDB: ${manifest.symbols.assemblies_with_pdb}\n- Embedded sources recovered: ${manifest.symbols.embedded_sources}\n\n${symbolRows || "- No assemblies scanned."}\n\nPDB documents record original paths, languages, and source hashes. Embedded sources are byte-identical producer copies under \`sources/\`; \`evidence/*.symbols.json\` is the authoritative record.`;
+  const resourceRows = assemblies
+    .filter((entry) => entry.resources !== null && entry.resources !== undefined)
+    .map((entry) => {
+      const resources = entry.resources;
+      if (resources.status === "none") return `- \`${entry.name}\`: no managed resources`;
+      if (resources.status === "unknown")
+        return `- \`${entry.name}\`: enumeration failed (${resources.error ?? "unknown error"})`;
+      return `- \`${entry.name}\` (${resources.status}): ${String(resources.entries.length)} entries`;
+    })
+    .join("\n");
+  const resourceSection =
+    manifest.resources === null
+      ? "- Resource recovery was disabled with --no-resources."
+      : `- Resource entries observed: ${manifest.resources.entries}\n\n${resourceRows || "- No assemblies scanned."}\n\nEntries already materialized by ILSpy project output (config JSON, .resx, XAML) are recorded, not duplicated; missing entries are extracted under \`resources/\`.`;
+  const deploymentSection =
+    manifest.deployment === null
+      ? "- Deployment collection was disabled with --no-deployment."
+      : manifest.deployment.error !== undefined && manifest.deployment.error !== null
+        ? `- Deployment collection failed: ${manifest.deployment.error}`
+        : `- Manifests: ${String(manifest.deployment.manifests.length)} (see \`deployment.json\`)\n- Frameworks: ${(manifest.deployment.summary?.frameworks ?? []).map((framework) => `${framework.name ?? "unknown"} ${framework.version ?? ""}`.trim()).join(", ") || "none recorded"}\n- NuGet packages: ${String(manifest.deployment.summary?.package_count ?? 0)}`;
+  const adjacentRows = (manifest.adjacent ?? [])
+    .map(
+      (file) =>
+        `- \`${file.path}\` (${file.kind}, ${file.bytes === null ? "unknown size" : `${String(file.bytes)} bytes`})${file.output === null || file.output === undefined ? ": recorded only" : `: copied to \`${file.output}\``}`,
+    )
+    .join("\n");
+  const adjacentSection =
+    manifest.adjacent === null || manifest.deployment === null
+      ? "- Adjacent-file collection was disabled with --no-deployment."
+      : `${adjacentRows || "- None found."}`;
   const report = `# .NET / Unity extraction report
 
 - Input: \`${inputPath}\`
@@ -1696,6 +2136,22 @@ ${hashSection}
 ## License-dongle checks
 
 ${licenseSection}
+
+## Symbols and embedded sources
+
+${symbolSection}
+
+## Managed resources
+
+${resourceSection}
+
+## Deployment manifests
+
+${deploymentSection}
+
+## Adjacent files
+
+${adjacentSection}
 
 ## .NET single-file bundles
 
@@ -1722,6 +2178,8 @@ ${skippedLines || "- None"}
 - ILSpy may produce partial output when dependencies are missing or code is obfuscated.
 - IL2CPP dummy assemblies contain names, fields and method addresses but empty method bodies.
 - Native, mixed-mode, and managed resources are not fully reconstructed by this workflow.
+- PDB sidecars larger than 4 MiB are recorded but not copied; read them in place.
+- SourceLink mappings are recorded as evidence only and are never fetched.
 `;
   await writeFile(join(outputPath, "REPORT.md"), report);
 

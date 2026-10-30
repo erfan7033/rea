@@ -104,6 +104,9 @@ it("documents the new extraction flags in help output", async () => {
     "--no-reference-rewrite",
     "--no-hash-scan",
     "--no-license-scan",
+    "--no-symbols",
+    "--no-resources",
+    "--no-deployment",
     "--json",
     "--quiet",
   ]) {

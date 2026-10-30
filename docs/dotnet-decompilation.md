@@ -30,9 +30,15 @@ rea-dotnet /path/to/product /path/to/product-rea-out --repo --build
 What you get in the output directory:
 
 - `decompiled/` — reconstructed C# and project files.
-- `evidence/` — REA evidence bundles (metadata, hashes, coverage).
+- `evidence/` — REA evidence bundles (metadata, hashes, coverage), plus one
+  `*.symbols.json` per assembly with PDB documents and SourceLink mappings.
+- `sources/` — byte-identical embedded sources recovered from PDBs.
+- `resources/` — managed resources missing from ILSpy project output.
+- `config/` — small adjacent files (configs, sidecar PDBs within the copy bound).
+- `deployment.json` — deployment manifests (`.deps.json`, `.runtimeconfig.json`)
+  with the shipped frameworks, NuGet packages, and runtime/native assets.
 - `manifest.json` — machine-readable extraction record (schema
-  `rea.dotnet-decompile/3`).
+  `rea.dotnet-decompile/5`).
 - `REPORT.md` — extraction report and limitations.
 - With `--repo`: `README.md`, `AGENT_TASK.md`, `dependencies.md`,
   `LIMITATIONS.md`, `TESTING.md`, `build.ps1`/`build.sh`, and
@@ -75,10 +81,36 @@ Pass `--no-reference-rewrite` to keep ILSpy's original reference paths.
 | `--no-reference-rewrite` | Keep ILSpy's original reference paths.                                |
 | `--no-hash-scan`         | Skip hash and obfuscated-name scanning.                               |
 | `--no-license-scan`      | Skip license-dongle check detection.                                  |
+| `--no-symbols`           | Skip PDB symbol recovery and embedded-source extraction.              |
+| `--no-resources`         | Skip managed-resource enumeration and recovery.                       |
+| `--no-deployment`        | Skip deployment-manifest and adjacent-file collection.                |
 | `--force`                | Allow writing into a non-empty output directory.                      |
 | `--json`                 | Print the final manifest as JSON on stdout.                           |
 | `--quiet`                | Send progress to stderr instead of stdout.                            |
 | `--detect`               | Report the detected layout as JSON without writing anything.          |
+
+## Symbols, embedded sources, and SourceLink
+
+Each assembly's embedded portable PDB is read first, falling back to a
+sidecar `.pdb` (Windows PDBs are reported, not parsed). PDB documents record
+original paths, languages, and source hashes; producer-embedded sources are
+recovered byte-identically under `sources/` (one file per PDB document row,
+mapped in per-assembly `symbols` and `evidence/*.symbols.json`). SourceLink
+mappings are recorded as evidence only and are never fetched. ILSpy still
+receives the sidecar PDB via `-usepdb` for local variable names when one
+exists next to the assembly. Disable with `--no-symbols`.
+
+## Managed resources and deployment
+
+`ilspycmd --list-resources` enumerates every managed resource. Entries already
+materialized by ILSpy project output (config JSON, `.resx` from `.resources`,
+XAML from BAML) are recorded with their recovered path, not duplicated;
+missing entries are extracted with `ilspycmd --resource` under `resources/`
+within size bounds. `.deps.json` and `.runtimeconfig.json` files are parsed
+into `deployment.json` (target frameworks, NuGet packages, runtime and native
+assets per library), and adjacent files — sidecar PDBs, `*.config`,
+`appsettings*.json`, XML docs — are recorded and copied when small. Disable
+with `--no-resources` and `--no-deployment`.
 
 ## Hash identification and obfuscated names
 
@@ -118,10 +150,37 @@ authorized.
 rea-gui
 ```
 
-`rea-gui` serves a local-only page (bound to `127.0.0.1` with a per-session
-token) over the same extraction pipeline: scan a target, run the extraction
-with the options above, inspect the manifest summary and report, and optionally
-launch a goal-driven local-model agent over the result.
+`rea-gui` serves a local-only wizard (bound to `127.0.0.1` with a
+per-session token) over the same extraction pipeline: each of the eight steps
+below carries its own plain-English how-to, and every step is clickable in the
+left-hand stepper.
+
+1. **Pick target** — paste a product folder, `.exe`, `.dll`, or `.app` (or
+   use Browse), then **Scan target** for header-only detection: managed,
+   single-file, IL2CPP, or native.
+2. **Configure** — grouped options with one-line explanations: repository
+   scaffold, build, scope (bundles, IL2CPP, framework assemblies), and every
+   evidence switch (members, PDBs, symbols, resources, deployment, hashes,
+   license, reference rewriting).
+3. **Run** — start the extraction with a live log, a `[i/n]` progress bar,
+   cancel, and open-output-folder.
+4. **Review** — the manifest dashboard: counts, repo, references, symbols,
+   resources, deployment frameworks and NuGet packages, hashes, license, plus
+   the full `REPORT.md`.
+5. **Assembly** — per-assembly tabs: overview, symbols and embedded sources,
+   resources, hashes and names, license findings.
+6. **Files** — browse `decompiled/`, `sources/` (byte-identical embedded
+   sources win on conflicts), `resources/`, `config/`, and `evidence/` with
+   capped text previews; binaries are labelled, never dumped.
+7. **Build** — **Build now** compiles the recovered solution (or every
+   project) through a streamed `dotnet` run, then shows the `TESTING.md`
+   verification checklist.
+8. **Next steps** — `AGENT_TASK.md`, `LIMITATIONS.md`, the exact `rea-goal`
+   command for headless runs, and an optional local-model agent launch.
+
+`rea-gui` never executes the target. The file browser and preview endpoints
+are confined to the chosen output folder, and every API call requires the
+session token printed with the server URL.
 
 ## Goal-driven agent runs
 
@@ -141,9 +200,12 @@ path remains unverified in this checkout.
 ## Limitations
 
 - Static analysis only; assemblies are never loaded or executed.
-- Decompiled C# is inference. REA metadata Evidence remains authoritative.
+- Decompiled C# is inference. REA metadata Evidence remains authoritative;
+  `sources/` files are byte-identical PDB copies and outrank decompiled text.
 - IL2CPP dummy assemblies carry names, fields, and RVA addresses but empty
   method bodies; native bodies need a native decompiler.
-- Native, mixed-mode, and managed resources are not fully reconstructed.
+- SourceLink mappings are evidence only and are never fetched by the workflow.
+- PDB sidecars above the copy bound are recorded, not copied; Windows PDBs are
+  reported, not parsed.
 - Obfuscated code, reflection, dependency injection, and dynamic loading remain
   unknown unless separately verified.
