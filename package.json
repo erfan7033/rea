@@ -40,7 +40,10 @@
   },
   "bin": {
     "rea": "scripts/rea.mjs",
-    "rea-agents": "scripts/rea.mjs"
+    "rea-agents": "scripts/rea.mjs",
+    "rea-goal": "scripts/rea-goal.mjs",
+    "rea-dotnet": "scripts/rea-dotnet-decompile.mjs",
+    "rea-gui": "scripts/rea-gui.mjs"
   },
   "engines": {
     "node": "^22.23.4 || ^24.22.1 || >=26.12.1"
@@ -70,6 +73,10 @@
     "bridge/android/ReaJadxBridge.java",
     "bridge/mitmproxy/capture.py",
     "scripts/rea.mjs",
+    "scripts/rea-goal.mjs",
+    "scripts/rea-gui.mjs",
+    "scripts/rea-dotnet-decompile.mjs",
+    "scripts/lib/dotnet-extraction.mjs",
     "scripts/lib/cli-process-environment.mjs",
     "scripts/rea-android-workspace-guardian.mjs",
     "scripts/electron-active-hook.cjs",

@@ -725,7 +725,9 @@ independent pinned-oracle parity. Production inspection needs none of those tool
   and remains non-canonical. When `REA_ILSPY_CMD_PATH` points to an absolute
   runnable `ilspycmd`, `verify:managed` runs a source-owned real ILSpy oracle
   and imports its C# output as reconstruction inference against exact static
-  member Evidence.
+  member Evidence. The `rea-dotnet` / `rea-gui` / `rea-goal` workflow in the
+  [decompilation guide](dotnet-decompilation.md) composes this evidence with
+  ILSpy projects, reference rewriting, and optional solution builds.
 - The package contains no .NET runtime, SDK, ILSpy installation, proprietary
   assembly, or compiled conformance fixture.
 - Setup never installs or upgrades those tools. Doctor may inspect an explicit

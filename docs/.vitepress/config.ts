@@ -63,6 +63,10 @@ export default defineConfig({
           { text: "Process capture", link: "/process-capture" },
           { text: ".NET assemblies", link: "/managed-code-analysis" },
           {
+            text: ".NET decompilation workflow",
+            link: "/dotnet-decompilation",
+          },
+          {
             text: "Python packaged applications",
             link: "/python-packaged-applications",
           },
