@@ -5,6 +5,7 @@ import {
   type ArtifactIntegrityPair,
 } from "../../domain/artifactIntegrity.js";
 import { isAbsolute } from "node:path";
+import { createHash, type Hash } from "node:crypto";
 
 import {
   annotateEnglishUnicodeCaseCollisions,
@@ -12,6 +13,7 @@ import {
   normalizeArtifactPath,
 } from "../ArtifactPaths.js";
 import {
+  ArtifactEntryContentUnavailable,
   ArtifactReaderFailure,
   type ArtifactEntry,
   type ArtifactReader,
@@ -20,6 +22,10 @@ import {
 import { ArtifactTraversalObservation } from "../ArtifactTraversalObservation.js";
 import { DirectoryArtifactEntryAccessDenied } from "../DirectoryArtifactReader.js";
 import { AsarArtifactReader } from "../AsarArtifactReader.js";
+import {
+  InesArtifactReader,
+  type InesRegionScan,
+} from "../InesArtifactReader.js";
 import type { ArtifactNode } from "../../domain/artifactGraph.js";
 import {
   classifyArtifactContent,
@@ -41,9 +47,6 @@ export interface PendingIntegrityContradiction {
   readonly unpacked: boolean;
 }
 
-const UNAVAILABLE_UNPACKED_LIMITATION =
-  "ASAR unpacked companion bytes were unavailable; no content hash or child artifact was produced.";
-
 const emptyScan = (): {
   readonly nodes: Map<string, ArtifactNode>;
   readonly occurrences: MutableOccurrence[];
@@ -62,6 +65,13 @@ interface ScanContext {
   readonly registry: ArtifactPathRegistry;
   readonly expandedContainerIds: Set<string>;
   readonly ownedReaders: ArtifactReader[];
+  readonly reconstruction:
+    | {
+        readonly hash: Hash;
+        readonly regionOrder: string[];
+        bytes: number;
+      }
+    | undefined;
   readonly traversal: ArtifactTraversalObservation;
 }
 
@@ -76,6 +86,7 @@ export const scanReader = async (
   readonly occurrences: MutableOccurrence[];
   readonly pendingContradictions: PendingIntegrityContradiction[];
   readonly caseCollisionLimitation: string | undefined;
+  readonly inesRegionScan: InesRegionScan | undefined;
   readonly unknownParentOccurrences: ReadonlySet<MutableOccurrence>;
   readonly traversal: ArtifactReaderTraversal;
 }> => {
@@ -86,6 +97,7 @@ export const scanReader = async (
       occurrences,
       pendingContradictions,
       caseCollisionLimitation: undefined,
+      inesRegionScan: undefined,
       unknownParentOccurrences: new Set(),
       traversal: { status: "complete", limitations: [] },
     };
@@ -101,6 +113,10 @@ export const scanReader = async (
     registry: new ArtifactPathRegistry(),
     expandedContainerIds: new Set<string>(),
     ownedReaders,
+    reconstruction:
+      reader instanceof InesArtifactReader
+        ? { hash: createHash("sha256"), regionOrder: [], bytes: 0 }
+        : undefined,
     traversal: new ArtifactTraversalObservation(),
   };
   await visitArtifactEntries(context, reader, "");
@@ -122,6 +138,14 @@ export const scanReader = async (
     occurrences,
     pendingContradictions,
     caseCollisionLimitation: annotateEnglishUnicodeCaseCollisions(occurrences),
+    inesRegionScan:
+      context.reconstruction === undefined
+        ? undefined
+        : {
+            region_order: context.reconstruction.regionOrder,
+            bytes: context.reconstruction.bytes,
+            sha256: context.reconstruction.hash.digest("hex"),
+          },
     unknownParentOccurrences: parentResolution.unknownParentOccurrences,
     traversal: context.traversal.snapshot(),
   };
@@ -179,10 +203,13 @@ const visitArtifactEntries = async (
           : `${frame.prefix}/${entry.path}`,
       );
       const expandableAsar = isExpandableAsar(entry, logicalPath);
-      // PyInstaller TOC rows are source-distinct even when their logical
+      // PyInstaller rows and Bun modules are source-distinct even when their logical
       // destinations collide. Inventory retains those observations; the
       // extraction path registry remains the authority for materialization.
-      if (frame.reader.format !== "pyinstaller")
+      if (
+        frame.reader.format !== "pyinstaller" &&
+        frame.reader.format !== "bun-standalone"
+      )
         context.registry.add(
           logicalPath,
           expandableAsar ? "directory" : entry.kind,
@@ -212,15 +239,21 @@ const visitArtifactEntries = async (
           occurrence,
         );
       } catch (cause: unknown) {
-        let limitation = UNAVAILABLE_UNPACKED_LIMITATION;
-        if (cause instanceof DirectoryArtifactEntryAccessDenied) {
-          abortIfNeeded(context.signal);
-          limitation = cause.message;
-          context.traversal.onCoverage({
-            status: "unknown",
-            limitations: [limitation],
-          });
-        } else if (!isUnavailableUnpackedEntry(cause, entry)) throw cause;
+        if (
+          !(cause instanceof DirectoryArtifactEntryAccessDenied) &&
+          !(cause instanceof ArtifactEntryContentUnavailable)
+        )
+          throw cause;
+        abortIfNeeded(context.signal);
+        const limitation =
+          cause instanceof ArtifactEntryContentUnavailable
+            ? cause.limitation
+            : cause.message;
+        const traversal =
+          cause instanceof ArtifactEntryContentUnavailable
+            ? cause.traversal
+            : { status: "unknown" as const, limitations: [limitation] };
+        if (traversal !== undefined) context.traversal.onCoverage(traversal);
         occurrence.hash_status = "unavailable";
         occurrence.limitations.push(limitation);
       }
@@ -309,12 +342,23 @@ const digestArtifactEntry = async (
 > => {
   if ((entry.kind !== "file" && entry.kind !== "slice") || entry.encrypted)
     return undefined;
+  const reconstruction =
+    currentReader === context.reader ? context.reconstruction : undefined;
+  if (reconstruction !== undefined && entry.byteOffset !== reconstruction.bytes)
+    throw new ArtifactReaderFailure("integrity", "Noncontiguous iNES regions");
   const digest = await hashReadable(
     await currentReader.open(entry, context.signal),
     context.signal,
     entry.declaredIntegrity?.algorithm,
     context.asarHeaderAdmission,
+    reconstruction === undefined
+      ? undefined
+      : (chunk) => {
+          reconstruction.hash.update(chunk);
+          reconstruction.bytes += chunk.length;
+        },
   );
+  reconstruction?.regionOrder.push(entry.path);
   const claim = entry.declaredIntegrity;
   const observed = claim?.algorithm === "md5" ? digest.md5 : digest.sha256;
   if (claim !== null && observed === undefined)
@@ -362,11 +406,3 @@ const isExpandableAsar = (entry: ArtifactEntry, logicalPath: string): boolean =>
   entry.kind === "file" &&
   logicalPath.toLowerCase().endsWith(".asar") &&
   isAbsolute(entry.adapterKey);
-
-const isUnavailableUnpackedEntry = (
-  cause: unknown,
-  entry: ArtifactEntry,
-): boolean =>
-  entry.unpacked &&
-  cause instanceof ArtifactReaderFailure &&
-  cause.reason === "unavailable";

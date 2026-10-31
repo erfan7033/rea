@@ -6,6 +6,7 @@ import {
 import { artifactFormatMetadataSchema } from "./artifactFormatMetadata.js";
 import { z } from "zod";
 import { prefixedDigestSchema } from "./../domain/digests.js";
+import { inesInventorySchema } from "./inesContainer.js";
 
 /** Entry kinds or subtrees deliberately excluded by an artifact traversal. */
 export const artifactTraversalOmissionKindSchema = z.enum([
@@ -55,12 +56,17 @@ const artifactKindSchema = z.enum([
 ]);
 
 /** Recognized storage or application formats; unknown bytes remain explicit. */
-const artifactFormatSchema = z.enum([
+export const ARTIFACT_FORMAT_IDS = [
+  "dotnet-bundle",
+  "bun-standalone",
   "dmg",
   "zip",
   "pkg",
   "asar",
+  "ines",
   "godot-pck",
+  "unityfs",
+  "uimage",
   "javascript-bundle",
   "source-map",
   "mach-o-universal",
@@ -86,13 +92,29 @@ const artifactFormatSchema = z.enum([
   "file",
   "pyinstaller",
   "node-sea",
+  "intel-hex",
+  "srec",
+  "esp-image",
+  "esp-flash-image",
+  "fit",
   "unknown",
-]);
+] as const;
+
+export type ArtifactFormatId = (typeof ARTIFACT_FORMAT_IDS)[number];
+
+const artifactFormatSchema = z.enum(ARTIFACT_FORMAT_IDS);
 
 /** Formats established from bytes or a virtual directory tree, independent of path roles. */
 const artifactContentFormatSchema = artifactFormatSchema.extract([
+  "ines",
   "zip",
   "godot-pck",
+  "unityfs",
+  "uimage",
+  "intel-hex",
+  "srec",
+  "esp-image",
+  "fit",
   "mach-o-universal",
   "mach-o",
   "elf",
@@ -227,6 +249,7 @@ export const artifactInventoryResultSchema = z.strictObject({
   occurrences: z.array(artifactOccurrenceSchema),
   edges: z.array(artifactEdgeSchema),
   provenance: z.array(artifactCommandSchema),
+  ines: inesInventorySchema.exactOptional(),
   integrity_contradictions: z.array(integrityContradictionSchema),
   coverage: artifactInventoryCoverageSchema,
   limitations: z.array(z.string()),
