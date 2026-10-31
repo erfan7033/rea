@@ -9,7 +9,9 @@ optional reconstruction workflow that turns that static Evidence plus
 All three entry points are static analysis only. Targets are never executed,
 decompiled code is never run, and no network access is required. Decompiled C#
 is reconstructed source, not original source; `manifest.json` and `evidence/`
-remain the authoritative record.
+remain the authoritative record. For the full machine-to-verified-recovery
+procedure (workstation setup, source capture, toolchain, run, proof), follow
+the [workstation recovery runbook](workstation-recovery.md).
 
 ## Prerequisites
 

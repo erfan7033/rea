@@ -67,6 +67,10 @@ export default defineConfig({
             link: "/dotnet-decompilation",
           },
           {
+            text: "Workstation recovery runbook",
+            link: "/workstation-recovery",
+          },
+          {
             text: "Python packaged applications",
             link: "/python-packaged-applications",
           },
