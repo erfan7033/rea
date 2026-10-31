@@ -508,7 +508,7 @@ footer { color:var(--muted); font-size:12px; padding:0 24px 30px; max-width:1400
 <label class="f" for="assembly">Assembly</label>
 <input id="assembly" type="text" list="assemblyList" placeholder="Start typing an assembly name" autocomplete="off">
 <datalist id="assemblyList"></datalist>
-<div class="tabs" id="asmTabs"><button data-atab="overview" class="active">Overview</button><button data-atab="symbols">Symbols &amp; sources</button><button data-atab="resources">Resources</button><button data-atab="hashes">Hashes &amp; names</button><button data-atab="license">License</button></div>
+<div class="tabs" id="asmTabs"><button data-atab="overview" class="active">Overview</button><button data-atab="protection">Protection</button><button data-atab="symbols">Symbols &amp; sources</button><button data-atab="resources">Resources</button><button data-atab="hashes">Hashes &amp; names</button><button data-atab="license">License</button></div>
 <div id="assemblyDetail"><p class="sub">Run an extraction first, then pick an assembly.</p></div>
 </section>
 <section class="panel" data-step="6" hidden>
@@ -735,6 +735,8 @@ async function loadResult(out) {
     ((m.adjacent || []).length ? kvRow("Adjacent", esc(m.adjacent.length) + " files (" + esc(m.adjacent.filter((f) => f.output).length) + " copied to config/)") : "") +
     (m.hash_scan ? kvRow("Hashes", esc(m.hash_scan.total_candidates) + " candidates in " + esc(m.hash_scan.assemblies_scanned) + " assemblies") : "") +
     (m.license_scan ? kvRow("License", esc(m.license_scan.present) + " present · " + esc(m.license_scan.suspicious) + " suspicious") : "") +
+    (m.protection ? kvRow("Protection", esc(m.protection.obfuscation_likely) + " likely · " + esc(m.protection.obfuscation_suspicious) + " suspicious · " + Object.entries(m.protection.runtime_kinds || {}).map((kv) => esc(kv[0]) + " ×" + esc(kv[1])).join(", ")) : "") +
+    (m.protection ? kvRow("Signing", esc(m.protection.strong_named) + " strong-named · " + esc(m.protection.authenticode_signed) + " Authenticode-signed") : "") +
     (m.build ? kvRow("Build", m.build.ok ? '<span class="ok">all projects built</span>' : '<span class="bad">' + esc(m.build.failed) + " of " + esc(m.build.projects) + " failed</span>") : "") +
     '</div>' +
     (packages ? '<h2 style="margin-top:14px;font-size:13px">NuGet packages</h2><p class="sub">' + packages + '</p>' : '') +
@@ -765,6 +767,23 @@ const showAssembly = () => {
       kvRow("References", ((a.references || []).map((r) => "<code>" + esc(r.name) + "</code>").join(", ")) || "none") +
       kvRow("Status", esc(a.status) + (((a.errors || []).length) ? " · " + esc(a.errors.join("; ")) : "")) +
       '</div>';
+  } else if (tab === "protection") {
+    const p = a.protection;
+    if (!p) body = '<p class="sub">Protection analysis did not run for this assembly.</p>';
+    else {
+      const ob = p.obfuscation;
+      const obRows = ob.status === "none"
+        ? '<p class="sub">No obfuscator signals. Renamed-symbol ratios and watermark scans were clean.</p>'
+        : '<table><thead><tr><th>Tool</th><th>Signal</th><th>Detail</th><th>Confidence</th></tr></thead><tbody>' + (ob.indicators || []).map((f) => "<tr><td>" + esc(f.tool || "unknown tool") + (f.vendor ? "<br>" + esc(f.vendor) : "") + "</td><td><code>" + esc(f.signal) + "</code></td><td><code>" + esc(f.detail) + "</code>" + (f.note ? "<br>" + esc(f.note) : "") + "</td><td>" + esc(f.confidence) + "</td></tr>").join("") + "</tbody></table>";
+      const sign = p.signing;
+      body = '<div class="kv">' +
+        kvRow("Obfuscation", esc(ob.status)) +
+        kvRow("Runtime kind", "<code>" + esc(p.runtime_kind.kind) + "</code>" + (((p.runtime_kind.notes) || []).length ? "<br>" + esc(p.runtime_kind.notes.join(" ")) : "")) +
+        kvRow("Strong-named", sign.strong_named ? "yes" + (sign.public_key_token ? " · token <code>" + esc(sign.public_key_token) + "</code>" : "") : "no") +
+        kvRow("Authenticode", sign.authenticode.present ? "present (" + esc(sign.authenticode.count) + " entries" + (sign.authenticode.signers.length ? ": " + esc(sign.authenticode.signers.join("; ")) : "") + ")" : "no certificate table (presence only; chains are never verified)") +
+        '</div><h2 style="margin-top:12px;font-size:13px">Obfuscator indicators</h2>' + obRows +
+        '<p class="sub">Detection is static identity only — it never defeats or removes protection.</p>';
+    }
   } else if (tab === "symbols") {
     const s = a.symbols;
     if (!s) body = '<p class="sub">Symbol recovery was disabled or not run.</p>';

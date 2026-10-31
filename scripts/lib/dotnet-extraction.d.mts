@@ -105,4 +105,8 @@ export function scanDecompiledDirectory(
     readonly keyword: string;
     readonly files: readonly string[];
   }[];
+  readonly obfuscation_hits: readonly {
+    readonly marker: string;
+    readonly files: readonly string[];
+  }[];
 }>;

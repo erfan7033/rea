@@ -13,6 +13,8 @@ import {
 } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve } from "node:path";
 
+import { OBFUSCATION_TEXT_MARKERS } from "./dotnet-deconstruction.mjs";
+
 /**
  * Assemblies that ship with a framework, Unity runtime, or IL2CPP dump rather
  * than the application. They are skipped by default when extracting a folder so
@@ -505,6 +507,17 @@ const METHOD_DECLARATION_PATTERN =
 const DONGLE_KEYWORD_PATTERN =
   /hasp|hardlock|sentinel|aksusb|akshasp|codemeter|wibu|cmcrypt|axprotector|keylok|dinkey|rockey|guardant|unikey|dongle/giu;
 
+const escapeRegExp = (value) =>
+  value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+
+/** Case-insensitive watermark match over whitespace-collapsed source text. */
+const OBFUSCATION_MARKER_PATTERN = new RegExp(
+  OBFUSCATION_TEXT_MARKERS.map((marker) =>
+    escapeRegExp(marker.replace(/\s+/gu, "")),
+  ).join("|"),
+  "giu",
+);
+
 const truncateSample = (value, limit = 48) =>
   value.length > limit ? `${value.slice(0, limit)}...` : value;
 
@@ -543,6 +556,7 @@ export const scanDecompiledDirectory = async (
   const seen = new Set();
   const memberNames = { hash_like: 0, minified: 0, readable: 0, samples: [] };
   const keywordFiles = new Map();
+  const obfuscationFiles = new Map();
   let literals = 0;
   let truncated = false;
 
@@ -616,6 +630,12 @@ export const scanDecompiledDirectory = async (
       if (!keywordFiles.has(keyword)) keywordFiles.set(keyword, new Set());
       keywordFiles.get(keyword).add(relative(directory, file));
     }
+    const collapsed = text.toLowerCase().replace(/\s+/gu, "");
+    for (const match of collapsed.matchAll(OBFUSCATION_MARKER_PATTERN)) {
+      const marker = match[0].toLowerCase();
+      if (!obfuscationFiles.has(marker)) obfuscationFiles.set(marker, new Set());
+      obfuscationFiles.get(marker).add(relative(directory, file));
+    }
   }
 
   return {
@@ -630,6 +650,10 @@ export const scanDecompiledDirectory = async (
     member_names: memberNames,
     keyword_hits: [...keywordFiles.entries()].map(([keyword, files]) => ({
       keyword,
+      files: [...files].slice(0, 8),
+    })),
+    obfuscation_hits: [...obfuscationFiles.entries()].map(([marker, files]) => ({
+      marker,
       files: [...files].slice(0, 8),
     })),
   };

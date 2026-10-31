@@ -38,7 +38,7 @@ What you get in the output directory:
 - `deployment.json` — deployment manifests (`.deps.json`, `.runtimeconfig.json`)
   with the shipped frameworks, NuGet packages, and runtime/native assets.
 - `manifest.json` — machine-readable extraction record (schema
-  `rea.dotnet-decompile/5`).
+  `rea.dotnet-decompile/6`).
 - `REPORT.md` — extraction report and limitations.
 - With `--repo`: `README.md`, `AGENT_TASK.md`, `dependencies.md`,
   `LIMITATIONS.md`, `TESTING.md`, `build.ps1`/`build.sh`, and
@@ -144,6 +144,29 @@ It does not provide instructions to bypass, defeat, or circumvent license
 enforcement, and recovered output must be analyzed only where lawful and
 authorized.
 
+## Protection, runtime kind, and signing
+
+Every assembly gets a protection verdict from static identity alone, recorded
+in per-assembly `protection` and `REPORT.md`:
+
+- **Obfuscation** matches marker attributes (`ConfusedByAttribute`,
+  SmartAssembly/Dotfuscator/Crypto Obfuscator/Babel/Xenocode/Spices markers),
+  tool references, P/Invoke modules (VMProtect), resource names, watermark
+  strings from `#US` literals and decompiled text, and renamed-symbol ratios.
+  Attribute, reference, module, and resource matches are `likely`; watermark
+  strings and heavy renaming alone are `suspicious`. A generic
+  `ObfuscationAttribute` opt-out (`Exclude=true`) is not a signal.
+- **Runtime kind** is classified from REA metadata facts: IL-only with the
+  framework family, `mixed-mode` for C++/CLI, `readytorun` when precompiled
+  code ships alongside IL, and `metadata-only` for reference assemblies.
+- **Signing** reports strong-name status with the public-key token and
+  Authenticode table presence with signer subjects. Chains, timestamps, and
+  digest coverage are never verified — that stays with platform tooling.
+
+Nothing here defeats, removes, or bypasses any protection. Obfuscated
+assemblies decompile partially at best: virtualized methods and encrypted
+resources need dynamic or native analysis beyond this workflow.
+
 ## Graphical workbench
 
 ```bash
@@ -205,6 +228,9 @@ path remains unverified in this checkout.
 - IL2CPP dummy assemblies carry names, fields, and RVA addresses but empty
   method bodies; native bodies need a native decompiler.
 - SourceLink mappings are evidence only and are never fetched by the workflow.
+- Strong-name and Authenticode presence are reported, never verified.
+- Obfuscator identity is static evidence only; virtualized or encrypted
+  methods do not recover as readable C#.
 - PDB sidecars above the copy bound are recorded, not copied; Windows PDBs are
   reported, not parsed.
 - Obfuscated code, reflection, dependency injection, and dynamic loading remain

@@ -735,6 +735,400 @@ export const collectDeployment = async (rootPath, { maxFiles = MAX_DEPLOYMENT_FI
   return manifests.filter((manifest) => manifest.parsed !== null);
 };
 
+/**
+ * Known .NET obfuscator/packer markers. Detection is by static identity only:
+ * attribute and reference names injected by the tool, resource names,
+ * P/Invoke modules, and watermark strings. Name and string matches alone are
+ * suspicious; attribute, reference, module, or resource matches are likely.
+ * Nothing here defeats, removes, or bypasses any protection.
+ */
+export const OBFUSCATOR_SIGNALS = [
+  {
+    tool: "ConfuserEx",
+    markers: {
+      attributes: ["confusedbyattribute"],
+      strings: ["confuserex", "confused by", "github.com/yck1509/confuserex"],
+    },
+    note: "Open-source obfuscator; renames symbols and can encrypt strings and pack resources.",
+  },
+  {
+    tool: "Confuser",
+    markers: {
+      attributes: ["confusedbyattribute"],
+      strings: ["confuser.codeplex.com"],
+    },
+    note: "Classic open-source obfuscator; distinguish from ConfuserEx by the watermark string.",
+  },
+  {
+    tool: ".NET Reactor",
+    vendor: "Eziriz",
+    markers: {
+      strings: [".net reactor", "netreactor", "eziriz", "netguard"],
+    },
+    note: "Commercial protector; string encryption and native stub are common, so metadata strings may be unreadable.",
+  },
+  {
+    tool: "SmartAssembly",
+    vendor: "Red Gate",
+    markers: {
+      attributes: ["smartassembly.attributes.poweredbyattribute"],
+      references: ["smartassembly"],
+      resources: ["smartassembly"],
+      strings: ["smartassembly", "powered by smartassembly"],
+    },
+    note: "Red Gate protector; look for SmartAssembly.* resources carrying the real payload.",
+  },
+  {
+    tool: "Dotfuscator",
+    vendor: "PreEmptive",
+    markers: {
+      attributes: [
+        "preemptive.attributes.setupattribute",
+        "preemptive.attributes.featureattribute",
+      ],
+      strings: ["preemptive", "dotfuscator"],
+    },
+    note: "PreEmptive protector; Feature attributes name the applied transforms.",
+  },
+  {
+    tool: "Eazfuscator.NET",
+    markers: {
+      strings: ["eazfuscator"],
+      resources: ["eazfuscator"],
+    },
+    note: "Commercial obfuscator with code virtualization; method bodies may not decompile to readable C#.",
+  },
+  {
+    tool: "Babel.NET",
+    markers: {
+      attributes: ["babelattribute"],
+      strings: ["babelfor.net", "babelattribute"],
+    },
+    note: "Commercial obfuscator; BabelAttribute marks processed assemblies.",
+  },
+  {
+    tool: "Crypto Obfuscator",
+    vendor: "LogicNP",
+    markers: {
+      attributes: [
+        "cryptoobfuscator.protectedwithcryptoobfuscatorattribute",
+      ],
+      strings: ["cryptoobfuscator", "logicnp"],
+    },
+    note: "LogicNP protector; the marker attribute names the product directly.",
+  },
+  {
+    tool: "Agile.NET",
+    vendor: "SecureTeam",
+    markers: {
+      strings: ["agile.net", "agiledotnet"],
+    },
+    note: "SecureTeam obfuscator; also see CliSecure below.",
+  },
+  {
+    tool: "CliSecure",
+    vendor: "SecureTeam",
+    markers: {
+      strings: ["clisecure"],
+    },
+    note: "SecureTeam protector, often paired with Agile.NET.",
+  },
+  {
+    tool: "ILProtector",
+    markers: {
+      strings: ["ilprotector", "vmsoft"],
+    },
+    note: "Virtualizing protector; IL becomes native-backed and ILSpy output goes partial.",
+  },
+  {
+    tool: "Xenocode Postbuild",
+    markers: {
+      attributes: ["xenocode"],
+      resources: ["xenocode"],
+      strings: ["xenocode"],
+    },
+    note: "Post-build protector; virtualized methods resist static C# recovery.",
+  },
+  {
+    tool: "VMProtect",
+    markers: {
+      pinvoke: ["vmprotectsdk32", "vmprotectsdk64"],
+      strings: ["vmprotect"],
+    },
+    note: "Native virtualizer, usually guarding a stub or license check around managed code.",
+  },
+  {
+    tool: "Enigma Protector",
+    markers: {
+      strings: ["enigma protector", "enigma_ide"],
+    },
+    note: "Native packer/licensing shell; managed payloads hide behind it.",
+  },
+  {
+    tool: "Themida / WinLicense",
+    vendor: "Oreans",
+    markers: {
+      strings: ["themida", "winlicense", "oreans"],
+    },
+    note: "Oreans shell; static metadata may be intact while entry behavior is virtualized.",
+  },
+  {
+    tool: "DNGuard / NetGuard",
+    markers: {
+      strings: ["dnguard", "netguard"],
+    },
+    note: "Commercial protector with string encryption.",
+  },
+  {
+    tool: "MaxtoCode",
+    markers: {
+      strings: ["maxtocode"],
+    },
+    note: "X86/X64 encryption engine for managed code; decompiled bodies may be stubs.",
+  },
+  {
+    tool: "Spices.NET",
+    vendor: "9Rays",
+    markers: {
+      attributes: ["ninerays.obfuscator"],
+      strings: ["ninerays", "spices.net"],
+    },
+    note: "9Rays obfuscator; evaluation attributes mark trial-protected builds.",
+  },
+];
+
+/** Watermark substrings matched against decompiled text and #US literals. */
+export const OBFUSCATION_TEXT_MARKERS = [
+  "confusedby",
+  "confuserex",
+  "confused by",
+  ".net reactor",
+  "netreactor",
+  "eziriz",
+  "smartassembly",
+  "preemptive",
+  "dotfuscator",
+  "eazfuscator",
+  "babelfor.net",
+  "babelattribute",
+  "cryptoobfuscator",
+  "logicnp",
+  "agile.net",
+  "agiledotnet",
+  "clisecure",
+  "ilprotector",
+  "xenocode",
+  "vmprotect",
+  "enigma protector",
+  "enigma_ide",
+  "themida",
+  "winlicense",
+  "oreans",
+  "dnguard",
+  "maxtocode",
+  "ninerays",
+  "spices.net",
+  "obfuscation(exclude=false",
+  "obfuscation(exclude = false",
+  "obfuscation(false",
+];
+
+const lowerIncludes = (haystack, needle) =>
+  String(haystack ?? "").toLowerCase().includes(needle);
+
+const firstMatch = (values, needle) =>
+  values.find((value) => lowerIncludes(value, needle)) ?? null;
+
+/** Watermark comparison ignores whitespace: decompiled and collapsed forms match. */
+const collapseWhitespace = (value) =>
+  String(value ?? "").toLowerCase().replace(/\s+/gu, "");
+
+const firstCollapsedMatch = (values, needle) => {
+  const wanted = collapseWhitespace(needle);
+  return (
+    values.find((value) => collapseWhitespace(value).includes(wanted)) ?? null
+  );
+};
+
+/**
+ * Combine every static identity signal into one protection verdict.
+ * Attribute, reference, P/Invoke, and resource-name matches are likely;
+ * watermark strings and renamed-symbol ratios alone are suspicious.
+ * A generic ObfuscationAttribute opt-out (Exclude=true) is not a signal.
+ */
+export const matchObfuscatorSignals = ({
+  references = [],
+  resourceNames = [],
+  attributeNames = [],
+  pinvokeModules = [],
+  stringLiterals = [],
+  memberNames = null,
+  textMarkers = [],
+} = {}) => {
+  const indicators = [];
+  for (const entry of OBFUSCATOR_SIGNALS) {
+    const { tool, vendor, markers, note } = entry;
+    let finding = null;
+    for (const name of markers.attributes ?? []) {
+      const hit = firstMatch(attributeNames, name);
+      if (hit !== null) {
+        finding = { signal: "obfuscator-attribute", detail: hit, confidence: "high" };
+        break;
+      }
+    }
+    if (finding === null) {
+      for (const name of markers.references ?? []) {
+        const hit = firstMatch(references, name);
+        if (hit !== null) {
+          finding = { signal: "assembly-reference", detail: hit, confidence: "high" };
+          break;
+        }
+      }
+    }
+    if (finding === null) {
+      for (const name of markers.pinvoke ?? []) {
+        const hit = firstMatch(pinvokeModules, name);
+        if (hit !== null) {
+          finding = { signal: "pinvoke-module", detail: hit, confidence: "high" };
+          break;
+        }
+      }
+    }
+    if (finding === null) {
+      for (const name of markers.resources ?? []) {
+        const hit = firstMatch(resourceNames, name);
+        if (hit !== null) {
+          finding = { signal: "resource-name", detail: hit, confidence: "high" };
+          break;
+        }
+      }
+    }
+    if (finding === null) {
+      const pools = [...stringLiterals, ...textMarkers];
+      for (const marker of markers.strings ?? []) {
+        const hit = firstCollapsedMatch(pools, marker);
+        if (hit !== null) {
+          finding = { signal: "watermark-string", detail: hit, confidence: "medium" };
+          break;
+        }
+      }
+    }
+    if (finding !== null) {
+      indicators.push({
+        tool,
+        vendor: vendor ?? null,
+        ...finding,
+        note,
+      });
+    }
+  }
+
+  // Renamed symbols without a tool fingerprint: Obfuscar-style renaming and
+  // aggressive minification erase original names beyond static recovery.
+  if (memberNames !== null && typeof memberNames === "object") {
+    const renamed = (memberNames.hash_like ?? 0) + (memberNames.minified ?? 0);
+    const total =
+      renamed + (memberNames.readable ?? 0) + (memberNames.compiler_generated ?? 0);
+    if (total >= 20 && renamed / total >= 0.3) {
+      indicators.push({
+        tool: null,
+        vendor: null,
+        signal: "renamed-symbols",
+        detail: `${String(renamed)} of ${String(total)} sampled names are hash-like or minified`,
+        confidence: "medium",
+        note: "Symbol renaming (Obfuscar-style or minifier); original names are not recoverable statically.",
+      });
+    }
+  }
+
+  if (indicators.some((indicator) => indicator.confidence === "high"))
+    return { status: "likely", indicators };
+  if (indicators.length > 0) return { status: "suspicious", indicators };
+  return { status: "none", indicators: [] };
+};
+
+/**
+ * Classify how an assembly is meant to run from REA's own metadata facts.
+ * No bytes are re-read here; every input comes from inspect-managed-artifact.
+ */
+export const classifyRuntimeKind = ({
+  runtimeFamily = "unknown",
+  implementation = "unknown",
+  flagNames = [],
+  readyToRun = false,
+  entryPointKind = "none",
+  managedArchitecture = "unknown",
+} = {}) => {
+  const notes = [];
+  if (
+    runtimeFamily === "mixed-clr-native" ||
+    implementation === "cpp-cli-mixed" ||
+    (!flagNames.includes("il-only") && entryPointKind === "native-rva")
+  ) {
+    notes.push("Native code is linked into this image (C++/CLI or mixed mode).");
+    return { kind: "mixed-mode", notes };
+  }
+  if (readyToRun || implementation === "cil-and-ready-to-run") {
+    notes.push("ReadyToRun precompiled code ships alongside IL; decompilation reads the IL.");
+    return { kind: "readytorun", notes };
+  }
+  if (entryPointKind === "native-rva") {
+    notes.push("The entry point is a native RVA, not a managed token.");
+    return { kind: "native-entry", notes };
+  }
+  if (implementation === "metadata-only") {
+    notes.push("Reference assembly: metadata without method bodies.");
+    return { kind: "metadata-only", notes };
+  }
+  if (runtimeFamily !== "unknown") {
+    if (managedArchitecture !== "unknown")
+      notes.push(`Managed architecture ${managedArchitecture}.`);
+    return { kind: `il-only (${runtimeFamily})`, notes };
+  }
+  notes.push("Runtime family could not be established from the CLI header.");
+  return { kind: "unknown", notes };
+};
+
+/**
+ * Summarize signing identity from metadata facts plus the PE certificate
+ * table. Presence is reported; chains, timestamps, and digest coverage are
+ * explicitly out of scope and left to platform tooling.
+ */
+export const summarizeSigning = ({
+  publicKey = null,
+  assemblyFlags = 0,
+  flagNames = [],
+  certificates = null,
+} = {}) => {
+  const strongNamed =
+    flagNames.includes("strong-name-signed") ||
+    (typeof assemblyFlags === "number" && (assemblyFlags & 0x8) !== 0) ||
+    (publicKey !== null &&
+      publicKey !== undefined &&
+      publicKey.kind !== undefined &&
+      publicKey.kind !== "none");
+  const entries = Array.isArray(certificates?.entries) ? certificates.entries : [];
+  const signers = [];
+  for (const entry of entries) {
+    const candidate =
+      entry?.signer_subject ??
+      entry?.subject ??
+      entry?.certificate_subject ??
+      null;
+    if (typeof candidate === "string" && candidate.length > 0) signers.push(candidate);
+    if (signers.length >= 4) break;
+  }
+  return {
+    strong_named: strongNamed,
+    public_key_token: publicKey?.token ?? null,
+    authenticode: {
+      present: entries.length > 0,
+      count: entries.length,
+      signers,
+    },
+  };
+};
+
 export const deploymentSummary = (manifests) => {
   const packages = new Map();
   const frameworkMap = new Map();

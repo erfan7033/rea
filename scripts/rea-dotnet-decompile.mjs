@@ -49,11 +49,14 @@ import {
   sha256File,
 } from "./lib/dotnet-extraction.mjs";
 import {
+  classifyRuntimeKind,
   collectAdjacentFiles,
   collectDeployment,
   deploymentSummary,
+  matchObfuscatorSignals,
   recoverSymbols,
   sourceOutputName,
+  summarizeSigning,
 } from "./lib/dotnet-deconstruction.mjs";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -398,6 +401,7 @@ const summarizeMembers = async (path, env, bundlePath) => {
   return {
     ok: true,
     coverage: view.coverage,
+    parentEvidenceId: view.parent_evidence_id ?? null,
     counts: {
       types: rows.TypeDef ?? null,
       methods: rows.MethodDef ?? null,
@@ -486,6 +490,61 @@ const resourceOutputName = (name, index) => {
   return `${String(index).padStart(3, "0")}-${safeName(leaf)}`;
 };
 
+/** Page #US string literals from retained members evidence for watermark matching. */
+const pageUserStrings = async (env, bundlePath, evidenceId) => {
+  const literals = [];
+  let offset = 0;
+  const limit = 1000;
+  for (let page = 0; page < 2; page += 1) {
+    const result = await run(
+      process.execPath,
+      [
+        reaEntry,
+        "inspect-analysis-view",
+        JSON.stringify({
+          source: { kind: "retained-evidence", evidence_id: evidenceId },
+          view: { kind: "managed-members", collection: "user_strings", offset, limit },
+        }),
+        "--evidence-bundle",
+        bundlePath,
+        "--format",
+        "json",
+      ],
+      { env, timeout: 120_000 },
+    );
+    if (result.code !== 0) return { ok: false, error: result.stderr.trim().split("\n")[0] ?? "view failed" };
+    const payload = parseJson(result.stdout);
+    const rows = payload?.normalized_result?.page?.rows;
+    if (!Array.isArray(rows) || rows.length === 0) break;
+    for (const row of rows) {
+      if (typeof row?.value === "string" && row.value.length > 0) literals.push(row.value);
+      if (literals.length >= 2000) break;
+    }
+    if (rows.length < limit || literals.length >= 2000) break;
+    offset += rows.length;
+  }
+  return { ok: true, literals };
+};
+
+/** Inspect the PE certificate table without verifying anything. */
+const inspectCertificates = async (path, env) => {
+  const result = await run(
+    process.execPath,
+    [reaEntry, "inspect-pe-certificates", path, "--format", "json"],
+    { env, timeout: 120_000 },
+  );
+  if (result.code !== 0) {
+    return {
+      ok: false,
+      error: result.stderr.trim().split("\n")[0] ?? `exited ${String(result.code)}`,
+    };
+  }
+  const payload = parseJson(result.stdout);
+  const normalized = payload?.normalized_result;
+  if (normalized === undefined) return { ok: false, error: "no certificate result" };
+  return { ok: true, result: normalized };
+};
+
 const listManagedResources = async (ilspyPath, path, env) => {
   const result = await run(
     ilspyPath,
@@ -522,14 +581,16 @@ const recoverAssemblyResources = async ({
   resourcesDirectory,
   stem,
   env,
+  listed = null,
 }) => {
-  const listed = await listManagedResources(ilspyPath, assemblyPath, env);
-  if (!listed.ok) return { status: "unknown", entries: [], error: listed.error };
-  if (listed.entries.length === 0)
+  const listing =
+    listed ?? (await listManagedResources(ilspyPath, assemblyPath, env));
+  if (!listing.ok) return { status: "unknown", entries: [], error: listing.error };
+  if (listing.entries.length === 0)
     return { status: "none", entries: [], error: null };
   await mkdir(resourcesDirectory, { recursive: true });
   const entries = [];
-  for (const [index, name] of listed.entries.entries()) {
+  for (const [index, name] of listing.entries.entries()) {
     const leaf = String(name).split("/").pop();
     const container = String(name).split("/")[0];
     const materialized =
@@ -1169,7 +1230,13 @@ This repository is decompiled output, not the original source. Treat it as evide
 - IL2CPP method bodies. IL2CPP compiles IL to native code; dummy assemblies carry names, fields, and RVA addresses, not C# bodies.
 - Native or mixed-mode implementation code.
 - Original comments and source layout. Local variable names come from PDBs only when the producer shipped them; decompiled names are otherwise ILSpy inference.
-- Obfuscated or protected logic in its original form.
+- Obfuscated or protected logic in its original form. Protection analysis
+  (\`manifest.protection\`, \`REPORT.md\`) identifies the likely tool from static
+  markers only; it never deobfuscates, and renamed symbols are unrecoverable.
+  Virtualized methods (ILProtector, Xenocode, Eazfuscator VM) and native shells
+  (VMProtect, Themida, Enigma) need dynamic or native analysis beyond this workflow.
+- Strong-name and Authenticode presence are reported, never verified; chain,
+  timestamp, and digest coverage stay with platform tooling.
 
 ## Recovered byte-identical artifacts
 
@@ -1694,18 +1761,22 @@ const main = async () => {
       decompiled_files: 0,
       symbols: null,
       resources: null,
+      protection: null,
       status: "pending",
       errors: [],
     };
+    let membersForProtection = null;
+    let boundariesForProtection = null;
 
     if (options.members) {
       const members = await summarizeMembers(candidate, env, bundlePath);
-      if (members.ok)
+      if (members.ok) {
         entry.member_summary = {
           coverage: members.coverage,
           counts: members.counts,
         };
-      else entry.errors.push(`member summary: ${members.error}`);
+        membersForProtection = members;
+      } else entry.errors.push(`member summary: ${members.error}`);
     }
 
     await mkdir(assemblyOutput, { recursive: true });
@@ -1763,6 +1834,7 @@ const main = async () => {
         };
         entry.errors.push(`license scan: ${boundaries.error}`);
       } else {
+        boundariesForProtection = boundaries;
         const keywordHits = (entry.hash_scan?.keyword_hits ?? []).map(
           (hit) => ({ keyword: hit.keyword }),
         );
@@ -1803,6 +1875,17 @@ const main = async () => {
       entry.symbols = null;
     }
 
+    // Resource names feed both recovery and obfuscation detection; the listing
+    // is cheap and runs even when --no-resources skips extraction.
+    let resourceNames = [];
+    let resourceListing = null;
+    try {
+      resourceListing = await listManagedResources(ilspyPath, candidate, env);
+      if (resourceListing.ok) resourceNames = resourceListing.entries;
+    } catch {
+      resourceListing = null;
+    }
+
     if (options.resources && entry.decompiled_files > 0) {
       try {
         entry.resources = await recoverAssemblyResources({
@@ -1813,6 +1896,7 @@ const main = async () => {
           resourcesDirectory: join(resourcesDirectory, stem),
           stem,
           env,
+          listed: resourceListing,
         });
       } catch (cause) {
         entry.resources = { status: "unknown", entries: [], error: String(cause?.message ?? cause) };
@@ -1822,6 +1906,62 @@ const main = async () => {
       }
     } else {
       entry.resources = null;
+    }
+
+    // Protection: obfuscation identity, runtime kind, and signing. Static
+    // evidence only; nothing here defeats or removes any protection.
+    try {
+      const references = (entry.references ?? []).map((reference) => reference.name);
+      const attributeNames = Array.isArray(inspection.artifact.attributes)
+        ? inspection.artifact.attributes
+            .map((attribute) => attribute?.type_name)
+            .filter((name) => typeof name === "string")
+        : [];
+      let pinvokeModules = [];
+      if (boundariesForProtection !== null) {
+        pinvokeModules = boundariesForProtection.moduleRefs ?? [];
+      } else {
+        const protectionBoundaries = await inspectNativeBoundaries(candidate, env);
+        if (protectionBoundaries.ok) pinvokeModules = protectionBoundaries.moduleRefs ?? [];
+      }
+      let literals = [];
+      if (options.members && membersForProtection?.parentEvidenceId) {
+        const paged = await pageUserStrings(env, bundlePath, membersForProtection.parentEvidenceId);
+        if (paged.ok) literals = paged.literals;
+      }
+      const certificates = await inspectCertificates(candidate, env);
+      const obfuscation = matchObfuscatorSignals({
+        references,
+        resourceNames,
+        attributeNames,
+        pinvokeModules,
+        stringLiterals: literals,
+        memberNames: entry.hash_scan?.member_names ?? null,
+        textMarkers: (entry.hash_scan?.obfuscation_hits ?? []).map((hit) => hit.marker),
+      });
+      entry.protection = {
+        obfuscation,
+        runtime_kind: classifyRuntimeKind({
+          runtimeFamily: artifact.classification?.runtime_family ?? "unknown",
+          implementation: artifact.classification?.implementation ?? "unknown",
+          flagNames: artifact.pe?.cli?.flag_names ?? [],
+          readyToRun: artifact.pe?.cli?.ready_to_run_signature === true,
+          entryPointKind: artifact.pe?.cli?.entry_point?.kind ?? "none",
+          managedArchitecture: artifact.classification?.managed_architecture ?? "unknown",
+        }),
+        signing: summarizeSigning({
+          publicKey: artifact.assembly?.public_key ?? null,
+          assemblyFlags: artifact.assembly?.flags ?? 0,
+          flagNames: artifact.pe?.cli?.flag_names ?? [],
+          certificates: certificates.ok ? certificates.result : null,
+        }),
+        certificate_error: certificates.ok ? null : certificates.error,
+      };
+    } catch (cause) {
+      entry.protection = null;
+      entry.errors.push(
+        `protection: ${cause instanceof Error ? cause.message : String(cause)}`,
+      );
     }
     assemblies.push(entry);
 
@@ -1839,6 +1979,11 @@ const main = async () => {
   let hashAssemblies = 0;
   let licensePresent = 0;
   let licenseSuspicious = 0;
+  let obfuscationLikely = 0;
+  let obfuscationSuspicious = 0;
+  let runtimeKinds = {};
+  let strongNamed = 0;
+  let authenticodeSigned = 0;
   for (const assembly of assemblies) {
     const byAlgorithm = assembly.hash_scan?.hash_strings.by_algorithm ?? {};
     if (Object.keys(byAlgorithm).length > 0) hashAssemblies += 1;
@@ -1849,6 +1994,14 @@ const main = async () => {
     if (assembly.license_scan?.status === "present") licensePresent += 1;
     else if (assembly.license_scan?.status === "suspicious")
       licenseSuspicious += 1;
+    if (assembly.protection?.obfuscation?.status === "likely") obfuscationLikely += 1;
+    else if (assembly.protection?.obfuscation?.status === "suspicious")
+      obfuscationSuspicious += 1;
+    const kind = assembly.protection?.runtime_kind?.kind ?? "unknown";
+    runtimeKinds[kind] = (runtimeKinds[kind] ?? 0) + 1;
+    if (assembly.protection?.signing?.strong_named === true) strongNamed += 1;
+    if (assembly.protection?.signing?.authenticode?.present === true)
+      authenticodeSigned += 1;
   }
   // Deployment manifests and adjacent files describe the product as shipped:
   // target frameworks, NuGet/native assets, configs, and sidecar PDBs.
@@ -1909,7 +2062,7 @@ const main = async () => {
     }
   }
   const manifest = {
-    schema: "rea.dotnet-decompile/5",
+    schema: "rea.dotnet-decompile/6",
     generated_at: new Date().toISOString(),
     input: inputPath,
     output: outputPath,
@@ -1963,6 +2116,13 @@ const main = async () => {
     license_scan: options.licenseScan
       ? { present: licensePresent, suspicious: licenseSuspicious }
       : null,
+    protection: {
+      obfuscation_likely: obfuscationLikely,
+      obfuscation_suspicious: obfuscationSuspicious,
+      runtime_kinds: runtimeKinds,
+      strong_named: strongNamed,
+      authenticode_signed: authenticodeSigned,
+    },
     symbols: options.symbols
       ? {
           assemblies_with_pdb:
@@ -2116,6 +2276,21 @@ ${manifest.build === null ? "" : `- Build attempt: ${manifest.build.ok ? "all pr
     manifest.adjacent === null || manifest.deployment === null
       ? "- Adjacent-file collection was disabled with --no-deployment."
       : `${adjacentRows || "- None found."}`;
+  const protectionRows = assemblies
+    .filter((entry) => entry.protection !== null && entry.protection !== undefined)
+    .map((entry) => {
+      const protection = entry.protection;
+      const obfuscation = protection.obfuscation;
+      const obfuscationText =
+        obfuscation.status === "none"
+          ? "no obfuscator signals"
+          : `${obfuscation.status}: ${obfuscation.indicators.map((indicator) => `${indicator.tool ?? "renamed symbols"} [${indicator.signal}]`).join(", ")}`;
+      const signing = protection.signing;
+      const signingText = `${signing.strong_named ? "strong-named" : "not strong-named"}${signing.public_key_token === null || signing.public_key_token === undefined ? "" : ` (${signing.public_key_token})`}${signing.authenticode.present ? `, Authenticode signed (${String(signing.authenticode.count)} entries)` : ", no Authenticode table"}`;
+      return `- \`${entry.name}\` (${protection.runtime_kind.kind}): ${obfuscationText}; ${signingText}`;
+    })
+    .join("\n");
+  const protectionSection = `- Obfuscation likely: ${manifest.protection.obfuscation_likely}; suspicious: ${manifest.protection.obfuscation_suspicious}\n- Runtime kinds: ${Object.entries(manifest.protection.runtime_kinds).map(([kind, count]) => `${kind} x${String(count)}`).join(", ") || "none"}\n- Strong-named: ${manifest.protection.strong_named}; Authenticode-signed: ${manifest.protection.authenticode_signed}\n\n${protectionRows || "- No assemblies scanned."}\n\nDetection is by static identity only (marker attributes, references, P/Invoke modules, resource names, watermark strings, renamed-symbol ratios). It never defeats, removes, or bypasses any protection. Certificate presence is reported; chains and signatures are not verified.`;
   const report = `# .NET / Unity extraction report
 
 - Input: \`${inputPath}\`
@@ -2136,6 +2311,10 @@ ${hashSection}
 ## License-dongle checks
 
 ${licenseSection}
+
+## Protection, runtime kind, and signing
+
+${protectionSection}
 
 ## Symbols and embedded sources
 

@@ -213,6 +213,7 @@ it("scans reconstructed sources for hashes, names, and keywords", async () => {
     `namespace Shop;
 public static class Lic {
   public const string Token = "5d41402abc4b2a76b9719d911017c592";
+  public const string Note = "Confused by ConfuserEx";
   public static void a() {}
 }
 `,
@@ -231,4 +232,7 @@ public static class Check {
   expect(scanned.hash_strings.samples[0]?.value).toContain("5d41402abc");
   expect(scanned.member_names.minified).toBeGreaterThanOrEqual(1);
   expect(scanned.keyword_hits.map((hit) => hit.keyword)).toContain("dongle");
+  expect(scanned.obfuscation_hits.map((hit) => hit.marker)).toContain(
+    "confusedby",
+  );
 });

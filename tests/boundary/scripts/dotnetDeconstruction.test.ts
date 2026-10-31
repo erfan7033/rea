@@ -4,15 +4,18 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { expect, it } from "vitest";
 
 import {
+  classifyRuntimeKind,
   collectAdjacentFiles,
   collectDeployment,
   deploymentSummary,
   findEmbeddedPortablePdb,
+  matchObfuscatorSignals,
   parseDepsJson,
   parseRuntimeConfig,
   readPortablePdb,
   recoverSymbols,
   sourceOutputName,
+  summarizeSigning,
 } from "../../../scripts/lib/dotnet-deconstruction.mjs";
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
 
@@ -352,6 +355,144 @@ it("names embedded-source outputs without leaking producer paths", () => {
   expect(sourceOutputName("/a/b/Program.cs", 1)).toBe("0001-Program.cs");
   expect(sourceOutputName("C:\\src\\a:b.cs", 12)).toBe("0012-a_b.cs");
   expect(sourceOutputName("", 0)).toBe("0000-source");
+});
+
+it("matches obfuscator identity by signal strength", () => {
+  expect(matchObfuscatorSignals({})).toEqual({ status: "none", indicators: [] });
+
+  const attribute = matchObfuscatorSignals({
+    attributeNames: ["System.Reflection.ConfusedByAttribute"],
+  });
+  expect(attribute.status).toBe("likely");
+  expect(
+    attribute.indicators.some(
+      (indicator) =>
+        indicator.tool === "ConfuserEx" &&
+        indicator.signal === "obfuscator-attribute" &&
+        indicator.confidence === "high",
+    ),
+  ).toBe(true);
+
+  const reference = matchObfuscatorSignals({
+    references: ["SmartAssembly.Core", "System.Runtime"],
+  });
+  expect(reference.status).toBe("likely");
+  expect(
+    reference.indicators.some(
+      (indicator) =>
+        indicator.tool === "SmartAssembly" &&
+        indicator.signal === "assembly-reference",
+    ),
+  ).toBe(true);
+
+  const pinvoke = matchObfuscatorSignals({
+    pinvokeModules: ["VMProtectSDK64.dll"],
+  });
+  expect(pinvoke.status).toBe("likely");
+  expect(pinvoke.indicators[0]).toMatchObject({
+    tool: "VMProtect",
+    signal: "pinvoke-module",
+  });
+
+  const resource = matchObfuscatorSignals({
+    resourceNames: ["Xenocode.Postbuild.exe"],
+  });
+  expect(resource.status).toBe("likely");
+  expect(resource.indicators[0]?.tool).toBe("Xenocode Postbuild");
+
+  // Watermark strings alone are suspicious, never likely; whitespace is ignored.
+  const watermark = matchObfuscatorSignals({
+    stringLiterals: ["Powered   by SmartAssembly (build 8)"],
+  });
+  expect(watermark.status).toBe("suspicious");
+  expect(watermark.indicators[0]).toMatchObject({
+    tool: "SmartAssembly",
+    signal: "watermark-string",
+    confidence: "medium",
+  });
+
+  // A generic opt-out attribute is not a signal.
+  const optOut = matchObfuscatorSignals({
+    attributeNames: ["System.Reflection.ObfuscationAttribute"],
+  });
+  expect(optOut.status).toBe("none");
+
+  // Heavy renaming without a tool fingerprint stays suspicious and generic.
+  const renamed = matchObfuscatorSignals({
+    memberNames: { hash_like: 40, minified: 5, readable: 30 },
+  });
+  expect(renamed.status).toBe("suspicious");
+  expect(renamed.indicators[0]).toMatchObject({
+    tool: null,
+    signal: "renamed-symbols",
+  });
+
+  // Few renamed names are not a signal.
+  expect(
+    matchObfuscatorSignals({
+      memberNames: { hash_like: 1, minified: 0, readable: 50 },
+    }).status,
+  ).toBe("none");
+});
+
+it("classifies runtime kinds from metadata facts", () => {
+  expect(
+    classifyRuntimeKind({
+      runtimeFamily: "modern-dotnet",
+      implementation: "cil",
+      flagNames: ["il-only"],
+      entryPointKind: "metadata-token",
+      managedArchitecture: "anycpu",
+    }).kind,
+  ).toBe("il-only (modern-dotnet)");
+  expect(
+    classifyRuntimeKind({
+      runtimeFamily: "mixed-clr-native",
+      implementation: "cpp-cli-mixed",
+      flagNames: [],
+      entryPointKind: "native-rva",
+    }).kind,
+  ).toBe("mixed-mode");
+  expect(
+    classifyRuntimeKind({
+      runtimeFamily: "modern-dotnet",
+      implementation: "cil-and-ready-to-run",
+      flagNames: ["il-library"],
+      readyToRun: true,
+      entryPointKind: "metadata-token",
+    }).kind,
+  ).toBe("readytorun");
+  expect(classifyRuntimeKind({}).kind).toBe("unknown");
+});
+
+it("summarizes signing without verifying anything", () => {
+  expect(
+    summarizeSigning({
+      publicKey: { kind: "none", token: null },
+      assemblyFlags: 0,
+      flagNames: ["il-only"],
+      certificates: { entries: [] },
+    }),
+  ).toEqual({
+    strong_named: false,
+    public_key_token: null,
+    authenticode: { present: false, count: 0, signers: [] },
+  });
+  const signed = summarizeSigning({
+    publicKey: { kind: "full", token: "b77a5c561934e089" },
+    assemblyFlags: 8,
+    flagNames: ["strong-name-signed"],
+    certificates: {
+      entries: [{ signer_subject: "CN=Example Corp" }, { subject: "CN=Other" }],
+    },
+  });
+  expect(signed.strong_named).toBe(true);
+  expect(signed.public_key_token).toBe("b77a5c561934e089");
+  expect(signed.authenticode).toEqual({
+    present: true,
+    count: 2,
+    signers: ["CN=Example Corp", "CN=Other"],
+  });
 });
 
 it("bounds adjacent-file collection", async () => {
